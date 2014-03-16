@@ -60,6 +60,10 @@ public final class Constants {
     // Accessibility specific items
     public static final String  ACCESSIBILITY_SERVICE                 = "com.dattasmoon.pebble.plugin/com.dattasmoon.pebble.plugin.NotificationService";
 
+    // Msg types
+    public static final int     MESSAGE_NOTIFY_TITLE                  = 1000;
+    public static final int     MESSAGE_NOTIFY_BODY                   = 1000;
+
     public static enum Type {
         NOTIFICATION, SETTINGS
     };

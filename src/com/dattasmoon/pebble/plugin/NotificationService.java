@@ -12,7 +12,10 @@ package com.dattasmoon.pebble.plugin;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.*;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -25,12 +28,13 @@ import android.accessibilityservice.AccessibilityServiceInfo;
 import android.annotation.TargetApi;
 import android.app.Notification;
 import android.content.Context;
-import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.os.Build;
 import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
 import android.os.Parcelable;
 import android.os.PowerManager;
 import android.preference.PreferenceManager;
@@ -43,36 +47,27 @@ import android.widget.RemoteViews;
 import android.widget.TextView;
 
 import com.dattasmoon.pebble.plugin.Constants.Mode;
+import com.getpebble.android.kit.PebbleKit;
+import com.getpebble.android.kit.util.PebbleDictionary;
 
 public class NotificationService extends AccessibilityService {
-    private class queueItem {
-        public String title;
-        public String body;
 
-        public queueItem(String title, String body) {
-            this.title = title;
-            this.body = body;
-        }
-    }
+    private Mode                 mode                = Mode.EXCLUDE;
+    private boolean              notifications_only  = false;
+    private boolean              no_ongoing_notifs   = false;
+    private boolean              notification_extras = false;
+    private boolean              quiet_hours         = false;
+    private boolean              notifScreenOn       = true;
+    private JSONArray            converts            = new JSONArray();
+    private JSONArray            ignores             = new JSONArray();
+    private JSONArray            pkg_renames         = new JSONArray();
+    private Date                 quiet_hours_before  = null;
+    private Date                 quiet_hours_after   = null;
+    private String[]             packages            = null;
+    private File                 watchFile;
+    private Long                 lastChange;
 
-    private Mode     mode                   = Mode.EXCLUDE;
-    private boolean  notifications_only     = false;
-    private boolean  no_ongoing_notifs      = false;
-    private boolean  notification_extras    = false;
-    private boolean  quiet_hours            = false;
-    private boolean  notifScreenOn          = true;
-    private JSONArray converts              = new JSONArray();
-    private JSONArray ignores               = new JSONArray();
-    private JSONArray pkg_renames           = new JSONArray();
-    private long     min_notification_wait  = 0 * 1000;
-    private long     notification_last_sent = 0;
-    private Date     quiet_hours_before     = null;
-    private Date     quiet_hours_after      = null;
-    private String[] packages               = null;
-    private Handler  mHandler;
-    private File     watchFile;
-    private Long     lastChange;
-    Queue<queueItem> queue;
+    private final MessageManager messageManager      = new MessageManager();
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
@@ -92,25 +87,26 @@ public class NotificationService extends AccessibilityService {
             return;
         }
 
-        //handle quiet hours
-        if(quiet_hours){
+        // handle quiet hours
+        if (quiet_hours) {
 
             Calendar c = Calendar.getInstance();
             Date now = new Date(0, 0, 0, c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE));
             if (Constants.IS_LOGGABLE) {
-                Log.i(Constants.LOG_TAG, "Checking quiet hours. Now: " + now.toString() + " vs " +
-                        quiet_hours_before.toString() + " and " +quiet_hours_after.toString());
+                Log.i(Constants.LOG_TAG,
+                        "Checking quiet hours. Now: " + now.toString() + " vs " + quiet_hours_before.toString()
+                                + " and " + quiet_hours_after.toString());
             }
 
-            if(quiet_hours_before.after(quiet_hours_after)){
-                if(now.after(quiet_hours_after) && now.before(quiet_hours_before)){
+            if (quiet_hours_before.after(quiet_hours_after)) {
+                if (now.after(quiet_hours_after) && now.before(quiet_hours_before)) {
                     if (Constants.IS_LOGGABLE) {
                         Log.i(Constants.LOG_TAG, "Time is during quiet time. Returning.");
                     }
                     return;
                 }
 
-            } else if(now.before(quiet_hours_before) || now.after(quiet_hours_after)){
+            } else if (now.before(quiet_hours_before) || now.after(quiet_hours_after)) {
                 if (Constants.IS_LOGGABLE) {
                     Log.i(Constants.LOG_TAG, "Time is before or after the quiet hours time. Returning.");
                 }
@@ -133,11 +129,11 @@ public class NotificationService extends AccessibilityService {
                 }
             }
         }
-        if (no_ongoing_notifs){
+        if (no_ongoing_notifs) {
             Parcelable parcelable = event.getParcelableData();
             if (parcelable instanceof Notification) {
                 Notification notif = (Notification) parcelable;
-                if ((notif.flags & Notification.FLAG_ONGOING_EVENT) == Notification.FLAG_ONGOING_EVENT){
+                if ((notif.flags & Notification.FLAG_ONGOING_EVENT) == Notification.FLAG_ONGOING_EVENT) {
                     if (Constants.IS_LOGGABLE) {
                         Log.i(Constants.LOG_TAG,
                                 "Event is a notification, notification flag contains ongoing, and no ongoing notification is true. Returning.");
@@ -146,12 +142,10 @@ public class NotificationService extends AccessibilityService {
                 }
             } else {
                 if (Constants.IS_LOGGABLE) {
-                    Log.i(Constants.LOG_TAG,
-                            "Event is not a notification.");
+                    Log.i(Constants.LOG_TAG, "Event is not a notification.");
                 }
             }
         }
-
 
         // Handle the do not disturb screen on settings
         PowerManager powMan = (PowerManager) this.getSystemService(Context.POWER_SERVICE);
@@ -177,7 +171,7 @@ public class NotificationService extends AccessibilityService {
         PackageManager pm = getPackageManager();
 
         String eventPackageName;
-        if (event.getPackageName() != null){
+        if (event.getPackageName() != null) {
             eventPackageName = event.getPackageName().toString();
         } else {
             eventPackageName = "";
@@ -230,13 +224,13 @@ public class NotificationService extends AccessibilityService {
         String title = "";
         try {
             boolean renamed = false;
-            for(int i = 0; i < pkg_renames.length(); i++){
-                if(pkg_renames.getJSONObject(i).getString("pkg").equalsIgnoreCase(eventPackageName)){
+            for (int i = 0; i < pkg_renames.length(); i++) {
+                if (pkg_renames.getJSONObject(i).getString("pkg").equalsIgnoreCase(eventPackageName)) {
                     renamed = true;
                     title = pkg_renames.getJSONObject(i).getString("to");
                 }
             }
-            if(!renamed){
+            if (!renamed) {
                 title = pm.getApplicationLabel(pm.getApplicationInfo(eventPackageName, 0)).toString();
             }
         } catch (NameNotFoundException e) {
@@ -266,51 +260,52 @@ public class NotificationService extends AccessibilityService {
         }
 
         // Check ignore lists
-        for(int i = 0; i < ignores.length(); i++){
-            try{
+        for (int i = 0; i < ignores.length(); i++) {
+            try {
                 JSONObject ignore = ignores.getJSONObject(i);
                 String app = ignore.getString("app");
                 boolean exclude = ignore.optBoolean("exclude", true);
                 boolean case_insensitive = ignore.optBoolean("insensitive", true);
-                if((!app.equals("-1")) && (!eventPackageName.equalsIgnoreCase(app))){
-                    //this rule doesn't apply to all apps and this isn't the app we're looking for.
+                if ((!app.equals("-1")) && (!eventPackageName.equalsIgnoreCase(app))) {
+                    // this rule doesn't apply to all apps and this isn't the
+                    // app we're looking for.
                     continue;
                 }
                 String regex = "";
-                if(case_insensitive){
+                if (case_insensitive) {
                     regex += "(?i)";
                 }
-                if(!ignore.getBoolean("raw")){
+                if (!ignore.getBoolean("raw")) {
                     regex += Pattern.quote(ignore.getString("match"));
                 } else {
                     regex += ignore.getString("match");
                 }
                 Pattern p = Pattern.compile(regex);
                 Matcher m = p.matcher(notificationText);
-                if(m.find()){
-                    if(exclude){
+                if (m.find()) {
+                    if (exclude) {
                         if (Constants.IS_LOGGABLE) {
-                            Log.i(Constants.LOG_TAG, "Notification text of '" + notificationText + "' matches: '" + regex +"' and exclude is on. Returning");
+                            Log.i(Constants.LOG_TAG, "Notification text of '" + notificationText + "' matches: '"
+                                    + regex + "' and exclude is on. Returning");
                         }
                         return;
                     }
                 } else {
-                    if(!exclude){
-                        if(Constants.IS_LOGGABLE){
-                            Log.i(Constants.LOG_TAG, "Notification text of '" + notificationText + "' does not match: '" + regex +"' and include is on. Returning");
+                    if (!exclude) {
+                        if (Constants.IS_LOGGABLE) {
+                            Log.i(Constants.LOG_TAG, "Notification text of '" + notificationText
+                                    + "' does not match: '" + regex + "' and include is on. Returning");
                         }
                         return;
                     }
 
                 }
-            } catch (JSONException e){
+            } catch (JSONException e) {
                 continue;
             }
         }
 
-
         // Send the alert to Pebble
-
         sendToPebble(title, notificationText);
 
         if (Constants.IS_LOGGABLE) {
@@ -328,43 +323,30 @@ public class NotificationService extends AccessibilityService {
             }
             return;
         }
-        for(int i = 0; i < converts.length(); i++){
+        for (int i = 0; i < converts.length(); i++) {
             String from;
             String to;
-            try{
+            try {
                 JSONObject convert = converts.getJSONObject(i);
                 from = "(?i)" + Pattern.quote(convert.getString("from"));
                 to = convert.getString("to");
-            } catch (JSONException e){
+            } catch (JSONException e) {
                 continue;
             }
-            //not sure if the title should be replaced as well or not. I'm guessing not
-            //title = title.replaceAll(from, to);
+            // not sure if the title should be replaced as well or not. I'm
+            // guessing not
+            // title = title.replaceAll(from, to);
             notificationText = notificationText.replaceAll(from, to);
         }
 
-        // Create json object to be sent to Pebble
-        final Map<String, Object> data = new HashMap<String, Object>();
+        // Create dictionary object to be sent to Pebble
+        PebbleDictionary alertMsg = new PebbleDictionary();
 
-        data.put("title", title);
+        alertMsg.addString(Constants.MESSAGE_NOTIFY_TITLE, title);
+        alertMsg.addString(Constants.MESSAGE_NOTIFY_BODY, notificationText);
 
-        data.put("body", notificationText);
-        final JSONObject jsonData = new JSONObject(data);
-        final String notificationData = new JSONArray().put(jsonData).toString();
-
-        // Create the intent to house the Pebble notification
-        final Intent i = new Intent(Constants.INTENT_SEND_PEBBLE_NOTIFICATION);
-        i.putExtra("messageType", Constants.PEBBLE_MESSAGE_TYPE_ALERT);
-        i.putExtra("sender", getString(R.string.app_name));
-        i.putExtra("notificationData", notificationData);
-
-        // Send the alert to Pebble
-        if (Constants.IS_LOGGABLE) {
-            Log.d(Constants.LOG_TAG, "About to send a modal alert to Pebble: " + notificationData);
-        }
-        sendBroadcast(i);
-        notification_last_sent = System.currentTimeMillis();
-
+        // TODO check string sizes
+        messageManager.offer(alertMsg);
     }
 
     @Override
@@ -394,8 +376,6 @@ public class NotificationService extends AccessibilityService {
         info.notificationTimeout = 100;
         setServiceInfo(info);
 
-        mHandler = new Handler();
-        queue = new LinkedList<queueItem>();
     }
 
     private void loadPrefs() {
@@ -405,16 +385,20 @@ public class NotificationService extends AccessibilityService {
         SharedPreferences sharedPref = PreferenceManager.getDefaultSharedPreferences(this);
 
         SharedPreferences sharedPreferences = getSharedPreferences(Constants.LOG_TAG, MODE_MULTI_PROCESS | MODE_PRIVATE);
-        //if old preferences exist, convert them.
-        if(sharedPreferences.contains(Constants.LOG_TAG + ".mode")){
+        // if old preferences exist, convert them.
+        if (sharedPreferences.contains(Constants.LOG_TAG + ".mode")) {
             SharedPreferences.Editor editor = sharedPref.edit();
-            editor.putInt(Constants.PREFERENCE_MODE, sharedPreferences.getInt(Constants.LOG_TAG + ".mode", Constants.Mode.OFF.ordinal()));
-            editor.putString(Constants.PREFERENCE_PACKAGE_LIST, sharedPreferences.getString(Constants.LOG_TAG + ".packageList", ""));
-            editor.putBoolean(Constants.PREFERENCE_NOTIFICATIONS_ONLY, sharedPreferences.getBoolean(Constants.LOG_TAG + ".notificationsOnly", true));
-            editor.putBoolean(Constants.PREFERENCE_NOTIFICATION_EXTRA, sharedPreferences.getBoolean(Constants.LOG_TAG + ".fetchNotificationExtras", false));
+            editor.putInt(Constants.PREFERENCE_MODE,
+                    sharedPreferences.getInt(Constants.LOG_TAG + ".mode", Constants.Mode.OFF.ordinal()));
+            editor.putString(Constants.PREFERENCE_PACKAGE_LIST,
+                    sharedPreferences.getString(Constants.LOG_TAG + ".packageList", ""));
+            editor.putBoolean(Constants.PREFERENCE_NOTIFICATIONS_ONLY,
+                    sharedPreferences.getBoolean(Constants.LOG_TAG + ".notificationsOnly", true));
+            editor.putBoolean(Constants.PREFERENCE_NOTIFICATION_EXTRA,
+                    sharedPreferences.getBoolean(Constants.LOG_TAG + ".fetchNotificationExtras", false));
             editor.commit();
 
-            //clear out all old preferences
+            // clear out all old preferences
             editor = sharedPreferences.edit();
             editor.clear();
             editor.commit();
@@ -434,29 +418,29 @@ public class NotificationService extends AccessibilityService {
         packages = sharedPref.getString(Constants.PREFERENCE_PACKAGE_LIST, "").split(",");
         notifications_only = sharedPref.getBoolean(Constants.PREFERENCE_NOTIFICATIONS_ONLY, true);
         no_ongoing_notifs = sharedPref.getBoolean(Constants.PREFERENCE_NO_ONGOING_NOTIF, false);
-        min_notification_wait = sharedPref.getInt(Constants.PREFERENCE_MIN_NOTIFICATION_WAIT, 0) * 1000;
         notification_extras = sharedPref.getBoolean(Constants.PREFERENCE_NOTIFICATION_EXTRA, false);
         notifScreenOn = sharedPref.getBoolean(Constants.PREFERENCE_NOTIF_SCREEN_ON, true);
         quiet_hours = sharedPref.getBoolean(Constants.PREFERENCE_QUIET_HOURS, false);
-        try{
+        try {
             converts = new JSONArray(sharedPref.getString(Constants.PREFERENCE_CONVERTS, "[]"));
-        } catch (JSONException e){
+        } catch (JSONException e) {
             converts = new JSONArray();
         }
-        try{
+        try {
             ignores = new JSONArray(sharedPref.getString(Constants.PREFERENCE_IGNORE, "[]"));
-        } catch (JSONException e){
+        } catch (JSONException e) {
             ignores = new JSONArray();
         }
-        try{
+        try {
             pkg_renames = new JSONArray(sharedPref.getString(Constants.PREFERENCE_PKG_RENAMES, "[]"));
-        } catch (JSONException e){
+        } catch (JSONException e) {
             pkg_renames = new JSONArray();
         }
-        //we only need to pull this if quiet hours are enabled. Save the cycles for the cpu! (haha)
-        if(quiet_hours){
+        // we only need to pull this if quiet hours are enabled. Save the cycles
+        // for the cpu! (haha)
+        if (quiet_hours) {
             String[] pieces = sharedPref.getString(Constants.PREFERENCE_QUIET_HOURS_BEFORE, "00:00").split(":");
-            quiet_hours_before= new Date(0, 0, 0, Integer.parseInt(pieces[0]), Integer.parseInt(pieces[1]));
+            quiet_hours_before = new Date(0, 0, 0, Integer.parseInt(pieces[0]), Integer.parseInt(pieces[1]));
             pieces = sharedPref.getString(Constants.PREFERENCE_QUIET_HOURS_AFTER, "23:59").split(":");
             quiet_hours_after = new Date(0, 0, 0, Integer.parseInt(pieces[0]), Integer.parseInt(pieces[1]));
         }
@@ -567,6 +551,97 @@ public class NotificationService extends AccessibilityService {
             return true;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    public class MessageManager implements Runnable {
+        public Handler                                messageHandler;
+        private final BlockingQueue<PebbleDictionary> messageQueue           = new LinkedBlockingQueue<PebbleDictionary>();
+        private Boolean                               isMessagePending       = Boolean.valueOf(false);
+        private long                                  notification_last_sent = 0;
+
+        @Override
+        public void run() {
+            Looper.prepare();
+            messageHandler = new Handler() {
+                @Override
+                public void handleMessage(Message msg) {
+                    Log.w(this.getClass().getSimpleName(), "Please post() your blocking runnables to Mr Manager, "
+                            + "don't use sendMessage()");
+                }
+
+            };
+            Looper.loop();
+        }
+
+        private void consumeAsync() {
+            messageHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    synchronized (isMessagePending) {
+                        if (isMessagePending.booleanValue()) {
+                            return;
+                        }
+
+                        synchronized (messageQueue) {
+                            if (messageQueue.size() == 0) {
+                                return;
+                            }
+                            // Send the alert to Pebble
+                            if (Constants.IS_LOGGABLE) {
+                                Log.d(Constants.LOG_TAG, "About to send an Alertify msg to Pebble: ");
+                            }
+
+                            // Wake the Alertify app
+                            // TODO replace null with Alertify uid
+                            PebbleKit.startAppOnPebble(getApplicationContext(), null);
+
+                            // Send it
+                            PebbleKit.sendDataToPebble(getApplicationContext(), null, messageQueue.peek());
+
+                            notification_last_sent = System.currentTimeMillis();
+
+                        }
+
+                        isMessagePending = Boolean.valueOf(true);
+                    }
+                }
+            });
+        }
+
+        public void notifyAckReceivedAsync() {
+            messageHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    synchronized (isMessagePending) {
+                        isMessagePending = Boolean.valueOf(false);
+                    }
+                    messageQueue.remove();
+                }
+            });
+            consumeAsync();
+        }
+
+        public void notifyNackReceivedAsync() {
+            messageHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    synchronized (isMessagePending) {
+                        isMessagePending = Boolean.valueOf(false);
+                    }
+                }
+            });
+            consumeAsync();
+        }
+
+        public boolean offer(final PebbleDictionary data) {
+            final boolean success = messageQueue.offer(data);
+
+            if (success) {
+                consumeAsync();
+            }
+
+            return success;
         }
     }
 
