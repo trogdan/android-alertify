@@ -14,6 +14,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.regex.Matcher;
@@ -67,6 +68,7 @@ public class NotificationService extends AccessibilityService {
     private File                 watchFile;
     private Long                 lastChange;
 
+    private static final UUID    ALERTIFY_UUID       = UUID.fromString("f0d3403d-9cec-4101-8502-2a801fe24761");
     private final MessageManager messageManager      = new MessageManager();
 
     @Override
@@ -342,8 +344,9 @@ public class NotificationService extends AccessibilityService {
         // Create dictionary object to be sent to Pebble
         PebbleDictionary alertMsg = new PebbleDictionary();
 
-        alertMsg.addString(Constants.MESSAGE_NOTIFY_TITLE, title);
-        alertMsg.addString(Constants.MESSAGE_NOTIFY_BODY, notificationText);
+        alertMsg.addUint8(Constants.MESSAGE_KEY_TYPE, Constants.MESSAGE_TYPE_ALERT);
+        alertMsg.addString(Constants.MESSAGE_KEY_TITLE, title);
+        alertMsg.addString(Constants.MESSAGE_KEY_BODY, notificationText);
 
         // TODO check string sizes
         messageManager.offer(alertMsg);
@@ -356,7 +359,9 @@ public class NotificationService extends AccessibilityService {
 
     @Override
     protected void onServiceConnected() {
-        // get inital preferences
+        new Thread(messageManager).start();
+
+        // get initial preferences
 
         watchFile = new File(getFilesDir() + "PrefsChanged.none");
         if (!watchFile.exists()) {
@@ -593,11 +598,10 @@ public class NotificationService extends AccessibilityService {
                             }
 
                             // Wake the Alertify app
-                            // TODO replace null with Alertify uid
-                            PebbleKit.startAppOnPebble(getApplicationContext(), null);
+                            PebbleKit.startAppOnPebble(getApplicationContext(), ALERTIFY_UUID);
 
                             // Send it
-                            PebbleKit.sendDataToPebble(getApplicationContext(), null, messageQueue.peek());
+                            PebbleKit.sendDataToPebble(getApplicationContext(), ALERTIFY_UUID, messageQueue.peek());
 
                             notification_last_sent = System.currentTimeMillis();
 
