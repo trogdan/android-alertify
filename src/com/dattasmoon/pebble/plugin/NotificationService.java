@@ -53,23 +53,27 @@ import com.getpebble.android.kit.util.PebbleDictionary;
 
 public class NotificationService extends AccessibilityService {
 
-    private Mode                 mode                = Mode.EXCLUDE;
-    private boolean              notifications_only  = false;
-    private boolean              no_ongoing_notifs   = false;
-    private boolean              notification_extras = false;
-    private boolean              quiet_hours         = false;
-    private boolean              notifScreenOn       = true;
-    private JSONArray            converts            = new JSONArray();
-    private JSONArray            ignores             = new JSONArray();
-    private JSONArray            pkg_renames         = new JSONArray();
-    private Date                 quiet_hours_before  = null;
-    private Date                 quiet_hours_after   = null;
-    private String[]             packages            = null;
-    private File                 watchFile;
-    private Long                 lastChange;
+    private Mode                         mode                = Mode.EXCLUDE;
+    private boolean                      notifications_only  = false;
+    private boolean                      no_ongoing_notifs   = false;
+    private boolean                      notification_extras = false;
+    private boolean                      quiet_hours         = false;
+    private boolean                      notifScreenOn       = true;
+    private JSONArray                    converts            = new JSONArray();
+    private JSONArray                    ignores             = new JSONArray();
+    private JSONArray                    pkg_renames         = new JSONArray();
+    private Date                         quiet_hours_before  = null;
+    private Date                         quiet_hours_after   = null;
+    private String[]                     packages            = null;
+    private File                         watchFile;
+    private Long                         lastChange;
 
-    private static final UUID    ALERTIFY_UUID       = UUID.fromString("f0d3403d-9cec-4101-8502-2a801fe24761");
-    private final MessageManager messageManager      = new MessageManager();
+    private static final UUID            ALERTIFY_UUID       = UUID.fromString("f0d3403d-9cec-4101-8502-2a801fe24761");
+    private Thread                       messageThread;
+    private final MessageManager         messageManager      = new MessageManager();
+    private PebbleKit.PebbleDataReceiver dataReceiver;
+    private PebbleKit.PebbleAckReceiver  ackReceiver;
+    private PebbleKit.PebbleNackReceiver nackReceiver;
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
@@ -359,7 +363,59 @@ public class NotificationService extends AccessibilityService {
 
     @Override
     protected void onServiceConnected() {
-        new Thread(messageManager).start();
+        // In order to interact with the UI thread from a broadcast receiver, we
+        // need to perform any updates through
+        // an Android handler. For more information, see:
+        // http://developer.android.com/reference/android/os/Handler
+        // .html
+        final Handler handler = new Handler();
+
+        // To receive data back from a watch-app, android
+        // applications must register a "DataReceiver" to operate on the
+        // dictionaries received from the watch.
+        dataReceiver = new PebbleKit.PebbleDataReceiver(ALERTIFY_UUID) {
+            @Override
+            public void receiveData(final Context context, final int transactionId, final PebbleDictionary data) {
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        // All data received from the Pebble must be ACK'd,
+                        // otherwise you'll hit time-outs in the
+                        // watch-app which will cause the watch to feel "laggy"
+                        // during periods of frequent
+                        // communication.
+                        PebbleKit.sendAckToPebble(context, transactionId);
+
+                        if (!data.iterator().hasNext()) {
+                            return;
+                        }
+                    }
+                });
+            }
+        };
+
+        PebbleKit.registerReceivedDataHandler(this, dataReceiver);
+
+        ackReceiver = new PebbleKit.PebbleAckReceiver(ALERTIFY_UUID) {
+            @Override
+            public void receiveAck(final Context context, final int transactionId) {
+                messageManager.notifyAckReceivedAsync();
+            }
+        };
+
+        PebbleKit.registerReceivedAckHandler(this, ackReceiver);
+
+        nackReceiver = new PebbleKit.PebbleNackReceiver(ALERTIFY_UUID) {
+            @Override
+            public void receiveNack(final Context context, final int transactionId) {
+                messageManager.notifyNackReceivedAsync();
+            }
+        };
+
+        PebbleKit.registerReceivedNackHandler(this, nackReceiver);
+
+        messageThread = new Thread(messageManager);
+        messageThread.start();
 
         // get initial preferences
 
